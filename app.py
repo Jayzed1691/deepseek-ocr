@@ -24,6 +24,7 @@ from utils.output_formatters import JSONFormatter, HTMLFormatter, DOCXFormatter,
 from utils.office_converters import OfficeConverter
 from utils.post_processing import PostProcessor, TextQualityAnalyzer
 from utils.i18n import I18n
+from utils.smart_pdf_loader import SmartPDFLoader, ProcessingStats, format_stats_summary, ExtractionMethod
 
 # Set page config
 st.set_page_config(
@@ -46,6 +47,8 @@ if 'comparison_results' not in st.session_state:
     st.session_state.comparison_results = None
 if 'post_processor' not in st.session_state:
     st.session_state.post_processor = PostProcessor()
+if 'processing_stats' not in st.session_state:
+    st.session_state.processing_stats = None
 
 # Get i18n instance
 i18n = st.session_state.i18n
@@ -228,6 +231,28 @@ def process_ocr(images, llm, sampling_params, prompt, crop_mode, num_workers=4):
 
     return outputs_list
 
+
+def create_ocr_callback(llm, sampling_params, prompt, crop_mode):
+    """Create an OCR callback function for SmartPDFLoader"""
+    from process.image_process import DeepseekOCRProcessor
+
+    def ocr_callback(image):
+        """Process a single image with DeepSeek-OCR"""
+        try:
+            cache_item = {
+                "prompt": prompt,
+                "multi_modal_data": {"image": DeepseekOCRProcessor().tokenize_with_images(
+                    images=[image], bos=True, eos=True, cropping=crop_mode
+                )},
+            }
+            output = llm.generate([cache_item], sampling_params=sampling_params)
+            return output[0].outputs[0].text if output else ""
+        except Exception as e:
+            st.error(f"OCR callback error: {str(e)}")
+            return ""
+
+    return ocr_callback
+
 # Header
 st.markdown(f'<h1 class="main-header">{i18n.t("app.title")}</h1>', unsafe_allow_html=True)
 st.markdown(f"### {i18n.t('app.subtitle')}")
@@ -306,6 +331,26 @@ with st.sidebar:
     # PDF Settings
     st.subheader("📄 " + i18n.t("sidebar.pdf_settings"))
     pdf_dpi = st.slider("PDF DPI", 72, 300, 144)
+
+    # Smart Processing Mode (Priority 2)
+    st.subheader("⚡ Smart Processing")
+    processing_mode = st.radio(
+        "PDF Processing Mode",
+        ["Smart (Hybrid)", "Force OCR"],
+        index=0,
+        help="Smart mode: Extract native text first (10-100x faster), fall back to OCR when needed. Force OCR: Always use OCR (slower but may handle special cases better)."
+    )
+
+    use_smart_mode = (processing_mode == "Smart (Hybrid)")
+
+    if use_smart_mode:
+        text_threshold = st.slider(
+            "Text Detection Threshold",
+            10, 200, 50,
+            help="Minimum characters to consider a page as having text. Lower = more sensitive."
+        )
+    else:
+        text_threshold = 50
 
     # Post-processing Settings
     with st.expander("🔍 " + i18n.t("post_processing.title"), expanded=False):
@@ -389,6 +434,7 @@ with tabs[0]:
                         )
 
                         all_results = []
+                        all_stats = []
                         progress_bar = st.progress(0)
                         status_text = st.empty()
 
@@ -400,7 +446,43 @@ with tabs[0]:
 
                             # Convert to images based on file type
                             if file_type == "application/pdf":
-                                images = pdf_to_images(file_bytes, dpi=pdf_dpi)
+                                if use_smart_mode:
+                                    # Use Smart PDF Loader (Priority 2)
+                                    status_text.text(f"Smart processing {uploaded_file.name}... (text extraction + OCR fallback)")
+
+                                    # Create OCR callback
+                                    ocr_callback = create_ocr_callback(llm, sampling_params, prompt, settings['crop_mode'])
+
+                                    # Process with smart loader
+                                    loader = SmartPDFLoader(
+                                        text_threshold=text_threshold,
+                                        force_ocr=False,
+                                        dpi=pdf_dpi,
+                                        enable_image_extraction=True
+                                    )
+                                    page_results, stats = loader.load_pdf(file_bytes, ocr_callback=ocr_callback)
+
+                                    # Extract images and create mock outputs for pages that used text extraction
+                                    images = [pr.image for pr in page_results]
+                                    outputs = []
+
+                                    for pr in page_results:
+                                        # Create a mock output object that mimics vLLM output
+                                        class MockOutput:
+                                            def __init__(self, text):
+                                                self.text = text
+
+                                        class MockOutputs:
+                                            def __init__(self, text):
+                                                self.outputs = [MockOutput(text)]
+
+                                        outputs.append(MockOutputs(pr.text))
+
+                                    all_stats.append(stats)
+                                else:
+                                    # Force OCR mode (original behavior)
+                                    images = pdf_to_images(file_bytes, dpi=pdf_dpi)
+                                    outputs = None  # Will be processed below
                             elif file_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                              "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                                              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]:
@@ -409,15 +491,19 @@ with tabs[0]:
                                     uploaded_file.name.split('.')[-1].lower(), 'docx'
                                 )
                                 images = OfficeConverter.convert_to_images(file_bytes, office_type, dpi=pdf_dpi)
+                                outputs = None  # Will be processed below
                             else:
                                 image = load_image(file_bytes)
                                 images = [image] if image else []
+                                outputs = None  # Will be processed below
 
                             if not images:
                                 st.warning(f"Skipping {uploaded_file.name}")
                                 continue
 
-                            outputs = process_ocr(images, llm, sampling_params, prompt, settings['crop_mode'], num_workers)
+                            # Process with OCR if not already done by smart mode
+                            if outputs is None:
+                                outputs = process_ocr(images, llm, sampling_params, prompt, settings['crop_mode'], num_workers)
 
                             file_results = {
                                 'filename': uploaded_file.name,
@@ -430,8 +516,44 @@ with tabs[0]:
                             progress_bar.progress((file_idx + 1) / len(uploaded_files))
 
                         st.session_state.processed_results = all_results
+                        st.session_state.processing_stats = all_stats if all_stats else None
                         status_text.text("✅ " + i18n.t("upload.complete"))
                         st.success(i18n.t("upload.complete"))
+
+                        # Display processing statistics if smart mode was used
+                        if all_stats:
+                            st.subheader("⚡ Processing Statistics")
+                            for idx, stats in enumerate(all_stats):
+                                with st.expander(f"📊 {uploaded_files[idx].name} - Statistics", expanded=True):
+                                    col1, col2, col3, col4 = st.columns(4)
+
+                                    with col1:
+                                        st.metric("Total Pages", stats.total_pages)
+                                        st.metric("Total Time", f"{stats.total_time:.1f}s")
+
+                                    with col2:
+                                        st.metric("Text Extracted", f"{stats.text_extracted_pages} ({stats.text_percentage:.0f}%)")
+                                        st.metric("Text Time", f"{stats.text_extraction_time:.1f}s")
+
+                                    with col3:
+                                        st.metric("OCR Processed", f"{stats.ocr_processed_pages} ({stats.ocr_percentage:.0f}%)")
+                                        st.metric("OCR Time", f"{stats.ocr_processing_time:.1f}s")
+
+                                    with col4:
+                                        st.metric("⚡ Speedup", f"{stats.speedup_estimate:.1f}x")
+                                        st.metric("Avg/Page", f"{stats.average_time_per_page:.2f}s")
+
+                                    # Visual breakdown
+                                    if stats.text_extracted_pages > 0 or stats.ocr_processed_pages > 0:
+                                        st.write("**Processing Breakdown:**")
+                                        breakdown_col1, breakdown_col2 = st.columns(2)
+
+                                        with breakdown_col1:
+                                            st.progress(stats.text_percentage / 100, text=f"Text: {stats.text_percentage:.0f}%")
+
+                                        with breakdown_col2:
+                                            st.progress(stats.ocr_percentage / 100, text=f"OCR: {stats.ocr_percentage:.0f}%")
+
                         st.balloons()
 
                 except Exception as e:
