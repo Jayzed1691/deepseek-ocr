@@ -26,6 +26,7 @@ from utils.post_processing import PostProcessor, TextQualityAnalyzer
 from utils.i18n import I18n
 from utils.smart_pdf_loader import SmartPDFLoader, ProcessingStats, format_stats_summary, ExtractionMethod
 from utils.local_rag import LocalRAGSystem, create_rag_system
+from utils.document_library import DocumentLibrary
 
 # Set page config
 st.set_page_config(
@@ -54,6 +55,8 @@ if 'rag_system' not in st.session_state:
     st.session_state.rag_system = None
 if 'rag_indexed_docs' not in st.session_state:
     st.session_state.rag_indexed_docs = set()
+if 'document_library' not in st.session_state:
+    st.session_state.document_library = DocumentLibrary()
 
 # Get i18n instance
 i18n = st.session_state.i18n
@@ -376,6 +379,7 @@ tabs = st.tabs([
     "📤 " + i18n.t("tabs.upload"),
     "📊 " + i18n.t("tabs.results"),
     "🤖 Document Q&A",
+    "📚 Document Library",
     "📁 " + i18n.t("tabs.batch"),
     "🔄 " + i18n.t("tabs.comparison"),
     "✏️ " + i18n.t("tabs.editor"),
@@ -523,6 +527,36 @@ with tabs[0]:
 
                         st.session_state.processed_results = all_results
                         st.session_state.processing_stats = all_stats if all_stats else None
+
+                        # Auto-register documents to library (Priority 4)
+                        library = st.session_state.document_library
+                        for idx, result in enumerate(all_results):
+                            # Calculate total characters
+                            total_chars = sum(len(out.outputs[0].text) for out in result['outputs'])
+
+                            # Determine processing method
+                            if all_stats and idx < len(all_stats):
+                                stat = all_stats[idx]
+                                if stat.text_percentage >= 80:
+                                    method = 'text'
+                                elif stat.ocr_percentage >= 80:
+                                    method = 'ocr'
+                                else:
+                                    method = 'hybrid'
+                            else:
+                                method = 'ocr'  # Default for non-PDF or force OCR
+
+                            # Add to library
+                            library.add_document(
+                                filename=result['filename'],
+                                file_type=result['type'],
+                                page_count=len(result['images']),
+                                processing_method=method,
+                                char_count=total_chars,
+                                tags=[],
+                                notes=f"Processed on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                            )
+
                         status_text.text("✅ " + i18n.t("upload.complete"))
                         st.success(i18n.t("upload.complete"))
 
@@ -980,8 +1014,249 @@ with tabs[2]:
                 except Exception as e:
                     st.error(f"Failed to clear database: {str(e)}")
 
-# Tab 4: Batch Processing
+# Tab 4: Document Library
 with tabs[3]:
+    st.header("📚 Document Library")
+
+    st.markdown("""
+    **Organize and manage your processed documents** with collections, tags, and metadata.
+    Build a persistent knowledge base across sessions.
+    """)
+
+    library = st.session_state.document_library
+
+    # Library Statistics
+    stats = library.get_stats()
+
+    st.subheader("📊 Library Statistics")
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric("Total Documents", stats.total_documents)
+        st.metric("Total Pages", f"{stats.total_pages:,}")
+
+    with col2:
+        st.metric("Total Characters", f"{stats.total_chars:,}")
+        st.metric("Indexed", stats.indexed_documents)
+
+    with col3:
+        st.metric("Collections", stats.collections_count)
+        st.metric("Unique Tags", stats.unique_tags)
+
+    with col4:
+        st.metric("Storage Size", f"{stats.storage_size_mb:.2f} MB")
+        if stats.newest_document:
+            newest_date = datetime.fromisoformat(stats.newest_document)
+            st.metric("Latest", newest_date.strftime("%Y-%m-%d"))
+
+    st.divider()
+
+    # Collections Management
+    st.subheader("📂 Collections")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        collections = library.list_collections()
+        if collections:
+            for coll in collections:
+                with st.expander(f"📁 {coll.name} ({coll.doc_count} docs)", expanded=False):
+                    st.write(f"**Description:** {coll.description or 'No description'}")
+                    if coll.tags:
+                        st.write(f"**Tags:** {', '.join(coll.tags)}")
+                    st.write(f"**Created:** {datetime.fromisoformat(coll.created_date).strftime('%Y-%m-%d')}")
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        if st.button("🗑️ Delete", key=f"del_coll_{coll.collection_id}"):
+                            if library.delete_collection(coll.collection_id, delete_documents=False):
+                                st.success(f"Deleted collection: {coll.name}")
+                                st.rerun()
+        else:
+            st.info("No collections yet. Create one below.")
+
+    with col2:
+        st.write("**Create New Collection**")
+        new_coll_name = st.text_input("Collection Name", key="new_coll_name")
+        new_coll_desc = st.text_area("Description", key="new_coll_desc")
+        new_coll_tags = st.text_input("Tags (comma-separated)", key="new_coll_tags")
+
+        if st.button("➕ Create Collection"):
+            if new_coll_name:
+                tags = [t.strip() for t in new_coll_tags.split(",")] if new_coll_tags else []
+                try:
+                    coll_id = library.create_collection(new_coll_name, new_coll_desc, tags)
+                    st.success(f"Created collection: {new_coll_name}")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+            else:
+                st.warning("Please enter a collection name")
+
+    st.divider()
+
+    # Document Management
+    st.subheader("📄 Documents")
+
+    # Filters
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        filter_collection = st.selectbox(
+            "Filter by Collection",
+            ["All"] + [c.name for c in collections],
+            key="filter_collection"
+        )
+
+    with col2:
+        all_tags = library.get_all_tags()
+        filter_tags = st.multiselect(
+            "Filter by Tags",
+            [tag[0] for tag in all_tags],
+            key="filter_tags"
+        )
+
+    with col3:
+        search_query = st.text_input("Search", placeholder="Filename or notes...", key="lib_search")
+
+    # Get documents
+    filter_coll = None if filter_collection == "All" else filter_collection
+    documents = library.list_documents(
+        collection=filter_coll,
+        tags=filter_tags if filter_tags else None,
+        search_query=search_query if search_query else None
+    )
+
+    st.write(f"**Found {len(documents)} document(s)**")
+
+    if documents:
+        for doc in documents[:20]:  # Show first 20
+            with st.expander(f"📄 {doc.filename} ({doc.page_count} pages)", expanded=False):
+                col_a, col_b, col_c = st.columns(3)
+
+                with col_a:
+                    st.write(f"**Type:** {doc.file_type}")
+                    st.write(f"**Pages:** {doc.page_count}")
+                    st.write(f"**Chars:** {doc.char_count:,}")
+
+                with col_b:
+                    st.write(f"**Method:** {doc.processing_method}")
+                    st.write(f"**Uploaded:** {datetime.fromisoformat(doc.upload_date).strftime('%Y-%m-%d %H:%M')}")
+                    st.write(f"**Collection:** {doc.collection or 'None'}")
+
+                with col_c:
+                    st.write(f"**Indexed:** {'✅' if doc.indexed else '❌'}")
+                    if doc.tags:
+                        st.write(f"**Tags:** {', '.join(doc.tags)}")
+                    if doc.notes:
+                        st.write(f"**Notes:** {doc.notes[:100]}...")
+
+                # Edit options
+                col_edit1, col_edit2 = st.columns(2)
+
+                with col_edit1:
+                    new_tags_str = st.text_input(
+                        "Tags (comma-separated)",
+                        value=", ".join(doc.tags),
+                        key=f"tags_{doc.doc_id}"
+                    )
+                    new_collection = st.selectbox(
+                        "Collection",
+                        ["None"] + [c.name for c in collections],
+                        index=0 if not doc.collection else ([c.name for c in collections].index(doc.collection) + 1 if doc.collection in [c.name for c in collections] else 0),
+                        key=f"coll_{doc.doc_id}"
+                    )
+
+                with col_edit2:
+                    new_notes = st.text_area(
+                        "Notes",
+                        value=doc.notes,
+                        key=f"notes_{doc.doc_id}",
+                        height=100
+                    )
+
+                col_btn1, col_btn2, col_btn3 = st.columns(3)
+
+                with col_btn1:
+                    if st.button("💾 Save Changes", key=f"save_{doc.doc_id}"):
+                        new_tags = [t.strip() for t in new_tags_str.split(",")] if new_tags_str else []
+                        new_coll = None if new_collection == "None" else new_collection
+                        if library.update_document(doc.doc_id, tags=new_tags, notes=new_notes, collection=new_coll):
+                            st.success("Updated!")
+                            st.rerun()
+
+                with col_btn2:
+                    if st.button("🗑️ Delete", key=f"del_doc_{doc.doc_id}"):
+                        if library.delete_document(doc.doc_id):
+                            st.success("Deleted!")
+                            st.rerun()
+
+        if len(documents) > 20:
+            st.info(f"Showing 20 of {len(documents)} documents. Use filters to narrow down.")
+    else:
+        st.info("No documents in library. Process PDFs and they'll appear here automatically.")
+
+    st.divider()
+
+    # Import/Export
+    st.subheader("💾 Import/Export")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("**Export Library**")
+        if st.button("📤 Export to JSON"):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_path = f"library_export_{timestamp}.json"
+            if library.export_library(export_path):
+                st.success(f"Exported to: {export_path}")
+                # Provide download button
+                try:
+                    with open(export_path, 'rb') as f:
+                        st.download_button(
+                            "⬇️ Download Export",
+                            data=f.read(),
+                            file_name=export_path,
+                            mime="application/json"
+                        )
+                except:
+                    pass
+            else:
+                st.error("Export failed")
+
+    with col2:
+        st.write("**Import Library**")
+        import_file = st.file_uploader("Upload library JSON", type=['json'], key="import_library")
+        merge_import = st.checkbox("Merge with existing data", value=True)
+
+        if import_file and st.button("📥 Import"):
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp:
+                tmp.write(import_file.read())
+                tmp_path = tmp.name
+
+            if library.import_library(tmp_path, merge=merge_import):
+                st.success("Import successful!")
+                os.unlink(tmp_path)
+                st.rerun()
+            else:
+                st.error("Import failed")
+                os.unlink(tmp_path)
+
+    # Tag Cloud
+    st.divider()
+    st.subheader("🏷️ Tag Cloud")
+
+    tags = library.get_all_tags()
+    if tags:
+        tag_cols = st.columns(5)
+        for idx, (tag_name, count) in enumerate(tags[:25]):
+            with tag_cols[idx % 5]:
+                st.metric(tag_name, count)
+    else:
+        st.info("No tags yet. Add tags to documents above.")
+
+# Tab 5: Batch Processing
+with tabs[4]:
     st.header(i18n.t("tabs.batch"))
 
     st.markdown("""
@@ -1063,8 +1338,8 @@ with tabs[3]:
                         results = st.session_state.job_queue.get_job_results(job['job_id'])
                         st.write(results)
 
-# Tab 5: Comparison Tool
-with tabs[4]:
+# Tab 6: Comparison Tool
+with tabs[5]:
     st.header(i18n.t("comparison.title"))
 
     st.markdown("""
@@ -1104,8 +1379,8 @@ with tabs[4]:
     else:
         st.info("Process some files first to enable comparison")
 
-# Tab 6: Interactive Editor
-with tabs[5]:
+# Tab 7: Interactive Editor
+with tabs[6]:
     st.header(i18n.t("editor.title"))
 
     if st.session_state.processed_results:
@@ -1166,8 +1441,8 @@ with tabs[5]:
     else:
         st.info("Process some files first to enable editing")
 
-# Tab 7: About
-with tabs[6]:
+# Tab 8: About
+with tabs[7]:
     st.header(i18n.t("tabs.about"))
 
     st.markdown("""
