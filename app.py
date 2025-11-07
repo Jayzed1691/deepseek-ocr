@@ -25,6 +25,7 @@ from utils.office_converters import OfficeConverter
 from utils.post_processing import PostProcessor, TextQualityAnalyzer
 from utils.i18n import I18n
 from utils.smart_pdf_loader import SmartPDFLoader, ProcessingStats, format_stats_summary, ExtractionMethod
+from utils.local_rag import LocalRAGSystem, create_rag_system
 
 # Set page config
 st.set_page_config(
@@ -49,6 +50,10 @@ if 'post_processor' not in st.session_state:
     st.session_state.post_processor = PostProcessor()
 if 'processing_stats' not in st.session_state:
     st.session_state.processing_stats = None
+if 'rag_system' not in st.session_state:
+    st.session_state.rag_system = None
+if 'rag_indexed_docs' not in st.session_state:
+    st.session_state.rag_indexed_docs = set()
 
 # Get i18n instance
 i18n = st.session_state.i18n
@@ -370,6 +375,7 @@ with st.sidebar:
 tabs = st.tabs([
     "📤 " + i18n.t("tabs.upload"),
     "📊 " + i18n.t("tabs.results"),
+    "🤖 Document Q&A",
     "📁 " + i18n.t("tabs.batch"),
     "🔄 " + i18n.t("tabs.comparison"),
     "✏️ " + i18n.t("tabs.editor"),
@@ -779,8 +785,203 @@ with tabs[1]:
     else:
         st.info("Upload and process files to see results here")
 
-# Tab 3: Batch Processing
+# Tab 3: Document Q&A (RAG System)
 with tabs[2]:
+    st.header("🤖 Document Q&A - Local RAG System")
+
+    st.markdown("""
+    **Ask questions about your processed documents** using on-device AI with Ollama.
+    No cloud APIs required - everything runs locally on your machine.
+    """)
+
+    # Configuration section
+    with st.expander("⚙️ RAG Configuration", expanded=False):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            ollama_model = st.text_input(
+                "Ollama Model",
+                value="llama3.2",
+                help="Ollama model for generation (llama3.2, mistral, phi, etc.)"
+            )
+            ollama_url = st.text_input(
+                "Ollama URL",
+                value="http://localhost:11434",
+                help="URL where Ollama is running"
+            )
+
+        with col2:
+            embedding_model = st.selectbox(
+                "Embedding Model",
+                ["all-MiniLM-L6-v2", "all-mpnet-base-v2"],
+                index=0,
+                help="all-MiniLM-L6-v2: Fast, 22MB | all-mpnet-base-v2: Better quality, 420MB"
+            )
+            num_results = st.slider(
+                "Retrieved Chunks",
+                1, 10, 5,
+                help="Number of relevant document chunks to retrieve"
+            )
+
+    # Initialize RAG system
+    if st.session_state.rag_system is None:
+        with st.spinner("Initializing RAG system..."):
+            try:
+                st.session_state.rag_system = create_rag_system(
+                    ollama_model=ollama_model,
+                    embedding_model=embedding_model
+                )
+                st.success("✅ RAG system initialized!")
+            except Exception as e:
+                st.error(f"Failed to initialize RAG system: {str(e)}")
+                st.info("Make sure dependencies are installed: `pip install chromadb sentence-transformers`")
+
+    # Check Ollama connection
+    if st.session_state.rag_system:
+        is_available, message = st.session_state.rag_system.check_ollama_connection()
+
+        if is_available:
+            st.success(f"✅ {message}")
+        else:
+            st.error(f"❌ {message}")
+            st.info("""
+            **To use Ollama:**
+            1. Install Ollama: https://ollama.ai
+            2. Run: `ollama serve`
+            3. Pull a model: `ollama pull llama3.2`
+            """)
+
+        # Get RAG stats
+        stats = st.session_state.rag_system.get_stats()
+
+        # Display stats
+        st.subheader("📊 Knowledge Base Status")
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("Indexed Chunks", stats['total_chunks'])
+
+        with col2:
+            st.metric("Unique Documents", stats['unique_documents'])
+
+        with col3:
+            st.metric("Model", stats['ollama_model'])
+
+        if stats['document_names']:
+            with st.expander("📚 Indexed Documents", expanded=False):
+                for doc_name in stats['document_names']:
+                    st.write(f"- {doc_name}")
+
+        # Add documents to knowledge base
+        st.subheader("➕ Add Documents to Knowledge Base")
+
+        if st.session_state.processed_results:
+            st.write(f"**{len(st.session_state.processed_results)} processed document(s) available**")
+
+            # Select documents to add
+            available_docs = [r['filename'] for r in st.session_state.processed_results]
+            unindexed_docs = [doc for doc in available_docs if doc not in st.session_state.rag_indexed_docs]
+
+            if unindexed_docs:
+                selected_docs = st.multiselect(
+                    "Select documents to add to knowledge base:",
+                    unindexed_docs,
+                    default=unindexed_docs[:1] if unindexed_docs else []
+                )
+
+                if st.button("🔄 Index Selected Documents"):
+                    if selected_docs:
+                        with st.spinner("Indexing documents..."):
+                            try:
+                                # Collect texts and metadata
+                                texts = []
+                                metadatas = []
+
+                                for result in st.session_state.processed_results:
+                                    if result['filename'] in selected_docs:
+                                        for idx, output in enumerate(result['outputs']):
+                                            text = output.outputs[0].text
+
+                                            # Clean text
+                                            if '<｜end▁of▁sentence｜>' in text:
+                                                text = text.replace('<｜end▁of▁sentence｜>', '')
+
+                                            texts.append(text)
+                                            metadatas.append({
+                                                'filename': result['filename'],
+                                                'page': idx + 1,
+                                                'file_type': result['type']
+                                            })
+
+                                # Add to RAG system
+                                chunks_added = st.session_state.rag_system.add_documents(texts, metadatas)
+
+                                # Track indexed docs
+                                st.session_state.rag_indexed_docs.update(selected_docs)
+
+                                st.success(f"✅ Added {chunks_added} chunks from {len(selected_docs)} document(s)!")
+                                st.rerun()
+
+                            except Exception as e:
+                                st.error(f"Failed to index documents: {str(e)}")
+                    else:
+                        st.warning("Please select at least one document to index")
+            else:
+                st.info("All processed documents have been indexed. Process more PDFs or clear the database.")
+
+        else:
+            st.info("No processed documents available. Upload and process PDFs first in the 'Upload & Process' tab.")
+
+        # Q&A Interface
+        st.subheader("💬 Ask Questions")
+
+        if stats['total_chunks'] > 0:
+            question = st.text_input(
+                "Ask a question about your documents:",
+                placeholder="e.g., What are the main findings? What was the revenue in Q4?"
+            )
+
+            if question:
+                with st.spinner("Searching and generating answer..."):
+                    try:
+                        result = st.session_state.rag_system.query(
+                            question,
+                            k=num_results,
+                            include_sources=True
+                        )
+
+                        st.markdown("### 💡 Answer")
+                        st.markdown(result.answer)
+
+                        st.markdown("### 📖 Sources")
+                        for idx, source in enumerate(result.sources, 1):
+                            with st.expander(f"Source {idx}: {source['filename']} (Page {source['page']})", expanded=False):
+                                st.write(source['content_preview'])
+
+                        # Show context used (for debugging)
+                        with st.expander("🔍 Retrieved Context (Debug)", expanded=False):
+                            st.text(result.context_used[:1000] + "..." if len(result.context_used) > 1000 else result.context_used)
+
+                    except Exception as e:
+                        st.error(f"Query failed: {str(e)}")
+        else:
+            st.info("Index some documents first to start asking questions.")
+
+        # Clear database option
+        with st.expander("🗑️ Database Management", expanded=False):
+            st.warning("**Danger Zone:** This will delete all indexed documents")
+
+            if st.button("Clear Knowledge Base", type="secondary"):
+                try:
+                    st.session_state.rag_system.clear_database()
+                    st.session_state.rag_indexed_docs.clear()
+                    st.success("✅ Knowledge base cleared!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to clear database: {str(e)}")
+
+# Tab 4: Batch Processing
+with tabs[3]:
     st.header(i18n.t("tabs.batch"))
 
     st.markdown("""
@@ -862,8 +1063,8 @@ with tabs[2]:
                         results = st.session_state.job_queue.get_job_results(job['job_id'])
                         st.write(results)
 
-# Tab 4: Comparison Tool
-with tabs[3]:
+# Tab 5: Comparison Tool
+with tabs[4]:
     st.header(i18n.t("comparison.title"))
 
     st.markdown("""
@@ -903,8 +1104,8 @@ with tabs[3]:
     else:
         st.info("Process some files first to enable comparison")
 
-# Tab 5: Interactive Editor
-with tabs[4]:
+# Tab 6: Interactive Editor
+with tabs[5]:
     st.header(i18n.t("editor.title"))
 
     if st.session_state.processed_results:
@@ -965,8 +1166,8 @@ with tabs[4]:
     else:
         st.info("Process some files first to enable editing")
 
-# Tab 6: About
-with tabs[5]:
+# Tab 7: About
+with tabs[6]:
     st.header(i18n.t("tabs.about"))
 
     st.markdown("""
