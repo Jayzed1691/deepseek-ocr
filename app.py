@@ -453,6 +453,7 @@ with tabs[0]:
 
                             file_bytes = uploaded_file.read()
                             file_type = uploaded_file.type
+                            current_stats = None  # Track stats for this specific file
 
                             # Convert to images based on file type
                             if file_type == "application/pdf":
@@ -489,6 +490,7 @@ with tabs[0]:
                                         outputs.append(MockOutputs(pr.text))
 
                                     all_stats.append(stats)
+                                    current_stats = stats  # Store stats for this specific file
                                 else:
                                     # Force OCR mode (original behavior)
                                     images = pdf_to_images(file_bytes, dpi=pdf_dpi)
@@ -519,7 +521,8 @@ with tabs[0]:
                                 'filename': uploaded_file.name,
                                 'images': images,
                                 'outputs': outputs,
-                                'type': file_type
+                                'type': file_type,
+                                'stats': current_stats  # Include stats for this file (None if not smart mode)
                             }
                             all_results.append(file_results)
 
@@ -530,13 +533,14 @@ with tabs[0]:
 
                         # Auto-register documents to library (Priority 4)
                         library = st.session_state.document_library
-                        for idx, result in enumerate(all_results):
+                        for result in all_results:
                             # Calculate total characters
                             total_chars = sum(len(out.outputs[0].text) for out in result['outputs'])
 
-                            # Determine processing method
-                            if all_stats and idx < len(all_stats):
-                                stat = all_stats[idx]
+                            # Determine processing method from stats stored in result
+                            stat = result.get('stats')  # Get stats for THIS specific file
+                            if stat:
+                                # Smart mode was used - determine method from statistics
                                 if stat.text_percentage >= 80:
                                     method = 'text'
                                 elif stat.ocr_percentage >= 80:
@@ -544,7 +548,8 @@ with tabs[0]:
                                 else:
                                     method = 'hybrid'
                             else:
-                                method = 'ocr'  # Default for non-PDF or force OCR
+                                # No stats: image file, office file, or Force OCR mode
+                                method = 'ocr'  # Default for non-smart mode
 
                             # Add to library
                             library.add_document(
@@ -563,36 +568,38 @@ with tabs[0]:
                         # Display processing statistics if smart mode was used
                         if all_stats:
                             st.subheader("⚡ Processing Statistics")
-                            for idx, stats in enumerate(all_stats):
-                                with st.expander(f"📊 {uploaded_files[idx].name} - Statistics", expanded=True):
-                                    col1, col2, col3, col4 = st.columns(4)
+                            for result in all_results:
+                                stats = result.get('stats')
+                                if stats:  # Only display if this file has stats
+                                    with st.expander(f"📊 {result['filename']} - Statistics", expanded=True):
+                                        col1, col2, col3, col4 = st.columns(4)
 
-                                    with col1:
-                                        st.metric("Total Pages", stats.total_pages)
-                                        st.metric("Total Time", f"{stats.total_time:.1f}s")
+                                        with col1:
+                                            st.metric("Total Pages", stats.total_pages)
+                                            st.metric("Total Time", f"{stats.total_time:.1f}s")
 
-                                    with col2:
-                                        st.metric("Text Extracted", f"{stats.text_extracted_pages} ({stats.text_percentage:.0f}%)")
-                                        st.metric("Text Time", f"{stats.text_extraction_time:.1f}s")
+                                        with col2:
+                                            st.metric("Text Extracted", f"{stats.text_extracted_pages} ({stats.text_percentage:.0f}%)")
+                                            st.metric("Text Time", f"{stats.text_extraction_time:.1f}s")
 
-                                    with col3:
-                                        st.metric("OCR Processed", f"{stats.ocr_processed_pages} ({stats.ocr_percentage:.0f}%)")
-                                        st.metric("OCR Time", f"{stats.ocr_processing_time:.1f}s")
+                                        with col3:
+                                            st.metric("OCR Processed", f"{stats.ocr_processed_pages} ({stats.ocr_percentage:.0f}%)")
+                                            st.metric("OCR Time", f"{stats.ocr_processing_time:.1f}s")
 
-                                    with col4:
-                                        st.metric("⚡ Speedup", f"{stats.speedup_estimate:.1f}x")
-                                        st.metric("Avg/Page", f"{stats.average_time_per_page:.2f}s")
+                                        with col4:
+                                            st.metric("⚡ Speedup", f"{stats.speedup_estimate:.1f}x")
+                                            st.metric("Avg/Page", f"{stats.average_time_per_page:.2f}s")
 
-                                    # Visual breakdown
-                                    if stats.text_extracted_pages > 0 or stats.ocr_processed_pages > 0:
-                                        st.write("**Processing Breakdown:**")
-                                        breakdown_col1, breakdown_col2 = st.columns(2)
+                                        # Visual breakdown
+                                        if stats.text_extracted_pages > 0 or stats.ocr_processed_pages > 0:
+                                            st.write("**Processing Breakdown:**")
+                                            breakdown_col1, breakdown_col2 = st.columns(2)
 
-                                        with breakdown_col1:
-                                            st.progress(stats.text_percentage / 100, text=f"Text: {stats.text_percentage:.0f}%")
+                                            with breakdown_col1:
+                                                st.progress(stats.text_percentage / 100, text=f"Text: {stats.text_percentage:.0f}%")
 
-                                        with breakdown_col2:
-                                            st.progress(stats.ocr_percentage / 100, text=f"OCR: {stats.ocr_percentage:.0f}%")
+                                            with breakdown_col2:
+                                                st.progress(stats.ocr_percentage / 100, text=f"OCR: {stats.ocr_percentage:.0f}%")
 
                         st.balloons()
 
