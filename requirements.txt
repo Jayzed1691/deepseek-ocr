@@ -22,5 +22,10 @@ python-pptx>=0.6.21
 pyspellchecker>=0.7.2
 language-tool-python>=2.7.1
 
+# RAG System (Priority 1) - Local, on-device
+chromadb>=0.4.22
+sentence-transformers>=2.2.2
+requests>=2.31.0
+
 # Optional dependencies (install as needed)
 # pypandoc  # For advanced DOCX conversion
